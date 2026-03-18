@@ -16,7 +16,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use std::collections::HashMap;
-use std::ops::Bound;
+use std::ops::{Add, Bound};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -298,7 +298,32 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        let state_read_guard = &self.state.read();
+
+        // First check in the current memtable
+        if let Some(value) = state_read_guard.memtable.get(_key) {
+            if value.is_empty() {
+                // found tombstone, return key not exists
+                return Ok(None);
+            } else {
+                // found value, return value
+                return Ok(Some(value));
+            }
+        }
+
+        // Then check in immutable memtables
+        for memtable in state_read_guard.imm_memtables.iter() {
+            if let Some(value) = memtable.get(_key) {
+                // check tombstone
+                if value.is_empty() {
+                    return Ok(None);
+                }
+
+                return Ok(Some(value));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -308,12 +333,87 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        if _key.is_empty() {
+            return Err(anyhow::anyhow!("key cannot be empty"));
+        }
+
+        if _value.is_empty() {
+            return Err(anyhow::anyhow!("value cannot be empty"));
+        }
+
+        let size;
+        {
+            let state_read_guard = &self.state.read();
+            state_read_guard.memtable.put(_key, _value)?;
+
+            size = state_read_guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        if _key.is_empty() {
+            return Err(anyhow::anyhow!("key cannot be empty"));
+        }
+
+        /*
+        Why are we calculating size of the memtable in a new scope?
+        Because, otherwise the state_read_guard lock will be held for the entire time of the function execution, including
+        freezing the memtable.
+        Doing it this way, we can release the lock after calculating the size and just before freezing the memtable.
+         */
+        let size;
+        {
+            let state_read_guard = &self.state.read();
+            let empty_slice = b"";
+            state_read_guard.memtable.put(_key, empty_slice)?;
+
+            size = state_read_guard.memtable.approximate_size();
+        }
+
+        self.try_freeze(size)?;
+
+        Ok(())
+    }
+
+    fn try_freeze(&self, estimated_size: usize) -> Result<()> {
+        /*
+        Consider the case that the memtable is about to reach the capacity limit and two threads successfully put two keys into the memtable,
+        both of them discovering the memtable reaches capacity limit after putting the two keys.
+        They will both do a size check on the memtable and decide to freeze it.
+        In this case, we might create one empty memtable which is then immediately frozen.
+        To solve the problem, all state modification should be synchronized through the state lock.
+         */
+
+        if estimated_size >= self.options.target_sst_size {
+            let state_lock = &self.state_lock.lock();
+            let state_read_guard = self.state.read();
+
+            // the memtable could have already been frozen, check again to ensure we really need to freeze
+            if state_read_guard.memtable.approximate_size() >= self.options.target_sst_size {
+                /*
+                The Lock Ordering Issue
+                Current locks held:
+                - state_lock (mutex guard) - line 392
+                - state_read_guard (read lock) - line 393
+                - What force_freeze_memtable needs: It needs to acquire a write lock on self.state (inside the force_freeze_memtable function)
+
+                The Problem:
+                - You can't upgrade from a read lock to a write lock on the same RwLock
+                - If you hold a read lock and try to acquire a write lock, it will deadlock because:
+                - The write lock waits for all read locks to be released
+                - But this thread is holding a read lock and waiting for the write lock
+                */
+                drop(state_read_guard);
+                self.force_freeze_memtable(state_lock)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -338,7 +438,23 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_mutable_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+
+        {
+            let mut state_write_guard = self.state.write();
+
+            // Swap the current memtable with a new one.
+            let mut snapshot = state_write_guard.as_ref().clone();
+            let old_memtable = std::mem::replace(&mut snapshot.memtable, new_mutable_memtable);
+
+            // Add the memtable to the immutable memtables of snapshot
+            snapshot.imm_memtables.insert(0, old_memtable.clone());
+
+            // Update the snapshot
+            *state_write_guard = Arc::new(snapshot);
+        }
+
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk

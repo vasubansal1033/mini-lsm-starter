@@ -25,6 +25,7 @@ use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use nom::AsBytes;
 use ouroboros::self_referencing;
+use std::sync::atomic::Ordering;
 
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
@@ -93,7 +94,7 @@ impl MemTable {
 
     /// Get a value by key.
     pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
-        let value = self.map.get(&Bytes::copy_from_slice(_key));
+        let value = self.map.get(_key);
 
         match value {
             Some(entry) => Some(entry.value().clone()),
@@ -112,6 +113,9 @@ impl MemTable {
         let entry = self
             .map
             .insert(Bytes::copy_from_slice(_key), Bytes::copy_from_slice(_value));
+
+        self.approximate_size
+            .fetch_add(estimated_size, Ordering::Relaxed);
 
         Ok(())
     }
